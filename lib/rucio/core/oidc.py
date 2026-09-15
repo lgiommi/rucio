@@ -18,6 +18,7 @@ import logging
 import subprocess  # noqa: S404 -- subprocess used for external commands
 import traceback
 from datetime import datetime, timedelta, timezone
+from functools import cache
 from math import floor
 from secrets import choice
 from typing import TYPE_CHECKING, Any, Final, Optional, Union
@@ -117,6 +118,98 @@ def _token_cache_get(
 def _token_cache_set(key: str, value: str) -> None:
     """Store a token in the cache."""
     REGION.set(key, value)
+
+
+@cache
+def _discover_token_endpoint(issuer: str) -> str:
+    """
+    Discover the OAuth2 token endpoint exposed by an OIDC issuer.
+    """
+    discovery_url = urljoin(
+        f"{issuer.rstrip('/')}/",
+        ".well-known/openid-configuration",
+    )
+
+    response = requests.get(discovery_url)
+    response.raise_for_status()
+
+    payload = response.json()
+    token_endpoint = payload["token_endpoint"]
+
+    if not isinstance(token_endpoint, str) or not token_endpoint:
+        raise ValueError(
+            f"Invalid token endpoint returned by issuer {issuer}"
+        )
+
+    return token_endpoint
+
+
+def request_client_credentials_token(
+    *,
+    issuer: str,
+    client_id: str,
+    client_secret: str,
+    scope: str,
+    use_cache: bool = True,
+) -> Optional[str]:
+    """
+    Request an OAuth2 access token using the client_credentials grant.
+    """
+
+    cache_identity = json.dumps(
+        {
+            "issuer": issuer,
+            "client_id": client_id,
+            "scope": scope,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    key = hashlib.sha256(
+        cache_identity.encode("utf-8")
+    ).hexdigest()
+
+    if use_cache and (token := _token_cache_get(key)):
+        return token
+
+    try:
+        token_endpoint = _discover_token_endpoint(issuer)
+
+        response = requests.post(
+            url=token_endpoint,
+            auth=(client_id, client_secret),
+            data={
+                "grant_type": "client_credentials",
+                "scope": scope,
+            },
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        token = payload["access_token"]
+
+        if not isinstance(token, str) or not token:
+            raise ValueError(
+                "OIDC provider returned an invalid access token"
+            )
+
+    except (
+        requests.RequestException,
+        requests.JSONDecodeError,
+        KeyError,
+        ValueError,
+    ):
+        logging.debug(
+            "Failed to procure a client credentials token",
+            exc_info=True,
+        )
+        return None
+
+    if use_cache:
+        _token_cache_set(key, token)
+
+    return token
 
 
 def request_token(audience: str, scope: str, use_cache: bool = True) -> Optional[str]:
