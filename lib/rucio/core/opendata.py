@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import time
+from functools import cache
 from re import match, search
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 from urllib.parse import urlencode, urlparse
@@ -34,6 +35,7 @@ from rucio.common.exception import OpenDataError, OpenDataInvalidStateUpdate
 from rucio.common.types import InternalAccount
 from rucio.core.did import list_files
 from rucio.core.monitor import MetricManager
+from rucio.core.oidc import request_client_credentials_token
 from rucio.core.replica import list_replicas
 from rucio.core.rule import add_rule
 from rucio.db.sqla import models
@@ -683,17 +685,139 @@ def _append_authz_query_parameter(uri: str, token: str) -> str:
     return parsed._replace(query=query).geturl()
 
 
+def _get_download_token_provider() -> str:
+    """
+    Return the configured token provider used for OpenData download URLs.
+
+    The ``opendata.download_token_provider`` configuration option controls
+    how authorization tokens for EOS download URLs are obtained. Supported
+    providers are ``eos`` and ``iam``.
+
+    If the option is not configured, the existing EOS token generation
+    mechanism is used for backward compatibility.
+
+    Returns:
+        The configured token provider name.
+
+    Raises:
+        ConfigurationError: If an unsupported token provider is configured.
+    """
+    provider = config_get(
+        "opendata",
+        "download_token_provider",
+        raise_exception=False,
+        default="eos",
+    ).lower()
+
+    if provider not in {"eos", "iam"}:
+        raise exception.ConfigurationError(
+            f"Unsupported OpenData download token provider '{provider}'."
+        )
+
+    return provider
+
+
+@cache
+def _load_iam_client_credentials() -> tuple[str, str, str]:
+    """
+    Load the client credentials used to request OpenData tokens from IAM.
+
+    The credentials are read from the JSON file configured through
+    ``opendata.iam_client_credentials``. The file must contain the IAM issuer,
+    client ID, and client secret.
+
+    Returns:
+        A tuple containing the IAM issuer, client ID, and client secret.
+
+    Raises:
+        ConfigurationError: If the credentials file cannot be read, does not
+            contain the required fields, or contains invalid values.
+    """
+    credentials_path = config_get(
+        "opendata",
+        "iam_client_credentials",
+        raise_exception=True,
+    )
+
+    try:
+        with open(credentials_path) as f:
+            credentials = json.load(f)
+
+        issuer = credentials["issuer"]
+        client_id = credentials["client_id"]
+        client_secret = credentials["client_secret"]
+
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise exception.ConfigurationError(
+            "Failed to load OpenData IAM client credentials."
+        ) from error
+
+    if not all(
+        isinstance(value, str) and value
+        for value in (issuer, client_id, client_secret)
+    ):
+        raise exception.ConfigurationError(
+            "Invalid OpenData IAM client credentials."
+        )
+
+    return issuer, client_id, client_secret
+
+
+def _iam_download_token(path: str) -> str:
+    """
+    Request an IAM access token granting read access to one EOS file.
+
+    The token is obtained using the OAuth2 ``client_credentials`` grant. The
+    requested WLCG storage scope is restricted to the exact EOS file path in
+    order to avoid granting access to a broader directory.
+
+    Args:
+        path: Absolute EOS file path for which read access is requested.
+
+    Returns:
+        The IAM access token.
+
+    Raises:
+        ResourceTemporaryUnavailable: If an IAM access token cannot be
+            obtained.
+        ConfigurationError: If the IAM client credentials are not configured
+            correctly.
+    """
+    issuer, client_id, client_secret = _load_iam_client_credentials()
+
+    scope = f"storage.read:{path}"
+
+    token = request_client_credentials_token(
+        issuer=issuer,
+        client_id=client_id,
+        client_secret=client_secret,
+        scope=scope,
+    )
+
+    if token is None:
+        raise exception.ResourceTemporaryUnavailable(
+            "Failed to obtain an IAM token for the OpenData download."
+        )
+
+    return token
+
+
 def _generate_download_urls(uris: list[str]) -> list[str]:
     """
-    Build tokenized download URLs for the given replica URIs.
+    Build tokenized OpenData download URLs for the given replica URIs.
 
-    Only valid HTTP(S) or DAV(S) URIs whose host exposes an EOS REST gateway are
-    considered. For each eligible URI, a read-only EOS token scoped to the
-    file path is requested and appended as an ``authz`` query parameter.
+    Only valid HTTP(S) or DAV(S) URIs whose host exposes an EOS REST gateway
+    are considered. For each eligible URI, an authorization token scoped to
+    the file path is obtained using the configured OpenData token provider and
+    appended as an ``authz`` query parameter.
+
+    The ``eos`` provider obtains a native EOS token from the EOS REST gateway.
+    The ``iam`` provider obtains an OAuth2 access token from the configured IAM
+    issuer using a file-specific ``storage.read`` scope.
 
     Malformed URIs, unsupported schemes, and confirmed non-EOS hosts are
-    skipped. Temporary EOS failures are tolerated while other independent
-    replicas are tried and are propagated if no download URL can be generated.
+    skipped. Backend failures are tolerated while other independent replicas
+    are tried and are propagated if no download URL can be generated.
 
     Args:
         uris: Replica URIs to process.
@@ -703,18 +827,32 @@ def _generate_download_urls(uris: list[str]) -> list[str]:
         empty if none of the provided URIs can be used.
 
     Raises:
-        ResourceTemporaryUnavailable: If no download URL can be generated
-            and at least one EOS backend operation failed temporarily.
+        ResourceTemporaryUnavailable: If no download URL can be generated and
+            at least one token provider or EOS backend operation failed
+            temporarily.
         OpenDataError: If no download URL can be generated and at least one
-            EOS backend operation failed permanently.
+            backend operation failed permanently.
+        ConfigurationError: If the configured download token provider or its
+            configuration is invalid.
     """
-    lifetime = config_get_int("opendata", "eos_token_lifetime", raise_exception=False,
-                              default=DEFAULT_EOS_TOKEN_LIFETIME_SECONDS)
+    token_provider = _get_download_token_provider()
+
+    eos_token_lifetime = (
+        config_get_int(
+            "opendata",
+            "eos_token_lifetime",
+            raise_exception=False,
+            default=DEFAULT_EOS_TOKEN_LIFETIME_SECONDS,
+        )
+        if token_provider == "eos"
+        else None
+    )
 
     download_urls = []
 
-    # The token lifetime and permission are constant within this invocation.
-    # Therefore, authority and normalized path identify the authorization scope.
+    # Avoid requesting the same authorization token more than once within this
+    # invocation. The EOS authority and normalized file path identify a replica
+    # authorization request.
     token_cache: dict[tuple[str, str], Optional[str]] = {}
 
     temporary_error: Optional[
@@ -753,12 +891,16 @@ def _generate_download_urls(uris: list[str]) -> list[str]:
             if token_scope not in token_cache:
                 if not _is_eos_host(eos_authority):
                     token_cache[token_scope] = None
+                elif token_provider == "iam":
+                    token_cache[token_scope] = _iam_download_token(path)
                 else:
+                    assert eos_token_lifetime is not None
+
                     token_cache[token_scope] = (
                         _eos_grpc_gateway_token_command(
                             eos_host=eos_authority,
                             filename=path,
-                            lifetime_seconds=lifetime,
+                            lifetime_seconds=eos_token_lifetime,
                         )
                     )
         except exception.ResourceTemporaryUnavailable as error:
