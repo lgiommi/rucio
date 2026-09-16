@@ -19,7 +19,7 @@ import time
 from functools import cache
 from re import match, search
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import requests
 from dogpile.cache.api import NoValue
@@ -56,11 +56,12 @@ REGION = MemcacheRegion(expiration_time=7200)
 EOS_PROBE_REGION = MemcacheRegion(expiration_time=86400)
 EOS_PROBE_NEGATIVE_REGION = MemcacheRegion(expiration_time=300)
 
-# Default lifetime of the EOS download tokens. It must be longer than the
-# expiration time of the file listing cache (REGION above) so that download
-# URLs served from the cache always carry a still-valid token.
+# Default lifetime of native EOS download tokens. It must be longer than the
+# expiration time of the file listing cache (REGION above) because native EOS
+# download URLs are stored in that cache. IAM download URLs are materialized
+# separately and are not cached with the file listing.
 DEFAULT_EOS_TOKEN_LIFETIME_SECONDS = 4 * 3600
-OPENDATA_DID_FILES_CACHE_VERSION = 2
+OPENDATA_DID_FILES_CACHE_VERSION = 3
 
 
 def is_valid_opendata_did_state(state: str) -> bool:
@@ -667,7 +668,7 @@ def _format_url_authority(host: str, port: Optional[int]) -> str:
     return host
 
 
-def _append_authz_query_parameter(uri: str, token: str) -> str:
+def _append_authz_query_parameter(uri: str, authz: str) -> str:
     """
     Append an authz parameter without reparsing or rebuilding the existing query.
 
@@ -675,7 +676,7 @@ def _append_authz_query_parameter(uri: str, token: str) -> str:
     valueless flags, ordering, and existing percent-encoding are not changed.
     """
     parsed = urlparse(uri)
-    authz_query = urlencode({"authz": token})
+    authz_query = urlencode({"authz": authz}, quote_via=quote)
 
     if parsed.query:
         query = f"{parsed.query}&{authz_query}"
@@ -923,8 +924,10 @@ def _generate_download_urls(uris: list[str]) -> list[str]:
         if not token:
             continue
 
+        authz = f"Bearer {token}" if token_provider == "iam" else token
+
         download_urls.append(
-            _append_authz_query_parameter(uri, token)
+            _append_authz_query_parameter(uri, authz)
         )
 
     # If at least one independent replica worked, return it. Otherwise,
@@ -983,12 +986,15 @@ def _make_opendata_did_files_cache_key(
     scope: "InternalScope",
     name: str,
     include_download_urls: bool,
+    token_provider: Optional[str],
 ) -> str:
     """
     Build a bounded and unambiguous cache key for Open Data DID file listings.
 
     The complete internal scope is included so cache entries remain isolated
-    between VOs. The structured identity is hashed to avoid ambiguous field
+    between VOs. The token provider is included for download URL requests so
+    cached entries produced for different authorization mechanisms cannot
+    overlap. The structured identity is hashed to avoid ambiguous field
     concatenation and Memcached's 250-byte key limit.
     """
     cache_identity = json.dumps(
@@ -996,6 +1002,7 @@ def _make_opendata_did_files_cache_key(
             "scope": scope.internal,
             "name": name,
             "include_download_urls": include_download_urls,
+            "token_provider": token_provider,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1009,6 +1016,60 @@ def _make_opendata_did_files_cache_key(
         f"opendata_did_files_v"
         f"{OPENDATA_DID_FILES_CACHE_VERSION}_{digest}"
     )
+
+
+def _materialize_iam_download_urls(
+    file_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Build IAM-protected download URLs from cached replica PFNs.
+
+    IAM access tokens are not stored in the OpenData file cache because their
+    lifetime can be shorter than the cached file listing. Instead, raw replica
+    PFNs are cached and converted to tokenized download URLs when the response
+    is built.
+
+    Args:
+        file_list: OpenData file entries containing raw download replica PFNs.
+
+    Returns:
+        A copy of the file list containing IAM-protected download URLs. The
+        internal raw download PFNs are not exposed in the returned entries.
+
+    Raises:
+        ReplicaNotFound: If no suitable IAM download URL can be generated for
+            a file.
+        ResourceTemporaryUnavailable: If IAM token generation temporarily
+            fails.
+        OpenDataError: If download URL generation fails permanently.
+    """
+    result: list[dict[str, Any]] = []
+
+    for cached_file in file_list:
+        file = {
+            key: value
+            for key, value in cached_file.items()
+            if key != "_download_uris"
+        }
+
+        download_uris = cached_file["_download_uris"]
+        download_urls = _generate_download_urls(download_uris)
+
+        if not download_urls:
+            logger.error(
+                "Failed to generate download URL for OpenData file %s:%s.",
+                file["scope"],
+                file["name"],
+            )
+            raise exception.ReplicaNotFound(
+                f"No suitable EOS download replica available "
+                f"for OpenData file {file['scope']}:{file['name']}."
+            )
+
+        file["download_urls"] = download_urls
+        result.append(file)
+
+    return result
 
 
 def get_opendata_did_files(
@@ -1048,20 +1109,32 @@ def get_opendata_did_files(
 
     time_start = time.perf_counter()
 
+    token_provider = (
+        _get_download_token_provider()
+        if include_download_urls
+        else None
+    )
+
     # Build a cache key which uniquely identifies the DID, VO, and
     # download URL inclusion mode.
     cache_key = _make_opendata_did_files_cache_key(
         scope,
         name,
         include_download_urls,
+        token_provider,
     )
 
     if use_cache:
         file_list = REGION.get(cache_key)
 
         if not isinstance(file_list, NoValue):
+            response_file_list = file_list
+
+            if include_download_urls and token_provider == "iam":
+                response_file_list = _materialize_iam_download_urls(file_list)
+
             result = {
-                "files": file_list,
+                "files": response_file_list,
                 "cache_hit": True,
                 "time_elapsed_millis": (time.perf_counter() - time_start) * 1000,
             }
@@ -1156,6 +1229,13 @@ def get_opendata_did_files(
             continue
 
         download_uris = download_uris_by_did[did_key]
+
+        if token_provider == "iam":
+            # Cache the raw download PFNs. IAM URLs are materialized when building
+            # the response so cached entries never contain an expired JWT.
+            file["_download_uris"] = download_uris
+            continue
+
         download_urls = _generate_download_urls(download_uris)
 
         if not download_urls:
@@ -1164,7 +1244,6 @@ def get_opendata_did_files(
                 file["scope"],
                 file["name"],
             )
-
             raise exception.ReplicaNotFound(
                 f"No suitable EOS download replica available "
                 f"for OpenData file {file['scope']}:{file['name']}."
@@ -1172,12 +1251,16 @@ def get_opendata_did_files(
 
         file["download_urls"] = download_urls
 
-    # Now that the file_list is fully built (with or without download URLs), cache it
     if use_cache:
         REGION.set(cache_key, file_list)
 
+    response_file_list = file_list
+
+    if include_download_urls and token_provider == "iam":
+        response_file_list = _materialize_iam_download_urls(file_list)
+
     result = {
-        "files": file_list,
+        "files": response_file_list,
         "cache_hit": False,
         "time_elapsed_millis": (time.perf_counter() - time_start) * 1000,
     }
