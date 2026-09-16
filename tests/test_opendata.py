@@ -263,6 +263,7 @@ class TestOpenDataCore:
             mock_scope,
             "n" * 250,
             True,
+            "eos",
         )
 
         assert len(cache_key.encode("utf-8")) <= 250
@@ -272,6 +273,7 @@ class TestOpenDataCore:
                 mock_scope,
                 "n" * 250,
                 False,
+                None,
             )
         )
 
@@ -285,11 +287,13 @@ class TestOpenDataCore:
             scope_vo1,
             "dataset",
             True,
+            "eos",
         )
         key_vo2 = opendata._make_opendata_did_files_cache_key(
             scope_vo2,
             "dataset",
             True,
+            "eos",
         )
 
         assert key_vo1 != key_vo2
@@ -299,11 +303,13 @@ class TestOpenDataCore:
             InternalScope("a_b"),
             "c",
             True,
+            "eos",
         )
         key_second = opendata._make_opendata_did_files_cache_key(
             InternalScope("a"),
             "b_c",
             True,
+            "eos",
         )
 
         assert key_first != key_second
@@ -617,6 +623,11 @@ class TestOpenDataEOS:
     def isolate_eos_probe_cache(self, monkeypatch):
         monkeypatch.setattr(opendata, "EOS_PROBE_REGION", _FakeCacheRegion())
         monkeypatch.setattr(opendata, "EOS_PROBE_NEGATIVE_REGION", _FakeCacheRegion())
+        monkeypatch.setattr(
+            opendata,
+            "_get_download_token_provider",
+            lambda: "eos",
+        )
 
     def test_is_eos_host_positive(self):
         eos_host = f"{self.eos_host}:8444"
