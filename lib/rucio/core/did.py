@@ -652,6 +652,25 @@ def __add_files_to_dataset(
         )
         files_to_add and session.execute(stmt, values)
         session.flush()
+
+        if parent_did.is_opendata and files_to_add:
+            stmt = update(
+                models.DataIdentifier
+            ).where(
+                models.DataIdentifier.did_type == DIDType.FILE,
+                exists(
+                    select(1).where(
+                        files_temp_table.scope == models.DataIdentifier.scope,
+                        files_temp_table.name == models.DataIdentifier.name,
+                    )
+                ),
+            ).values(
+                is_opendata=True
+            ).execution_options(
+                synchronize_session=False
+            )
+            session.execute(stmt)
+
         return files_to_add
     except IntegrityError as error:
         if match('.*IntegrityError.*ORA-02291: integrity constraint .*CONTENTS_CHILD_ID_FK.*violated - parent key not found.*', error.args[0]) \
@@ -1314,6 +1333,37 @@ def detach_dids(
         if did.events and child_events:
             did.events -= child_events
         associ_did.delete(session=session)
+
+        if did.did_type == DIDType.DATASET and did.is_opendata and child_type == DIDType.FILE:
+            # Keep the flag if the file belongs to another OpenData dataset.
+            other_opendata_parent = exists(
+                select(1)
+                .select_from(models.DataIdentifierAssociation)
+                .join(
+                    models.OpenDataDid,
+                    and_(
+                        models.OpenDataDid.scope == models.DataIdentifierAssociation.scope,
+                        models.OpenDataDid.name == models.DataIdentifierAssociation.name,
+                    ),
+                )
+                .where(
+                    models.DataIdentifierAssociation.child_scope == child_scope,
+                    models.DataIdentifierAssociation.child_name == child_name,
+                )
+            )
+
+            stmt = update(
+                models.DataIdentifier
+            ).where(
+                models.DataIdentifier.scope == child_scope,
+                models.DataIdentifier.name == child_name,
+                models.DataIdentifier.did_type == DIDType.FILE,
+            ).values(
+                is_opendata=case((other_opendata_parent, True), else_=False)
+            ).execution_options(
+                synchronize_session=False
+            )
+            session.execute(stmt)
 
         # Archive contents
         # If reattach happens, merge the latest due to primary key constraint

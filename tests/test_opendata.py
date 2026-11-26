@@ -25,10 +25,21 @@ from sqlalchemy.exc import IntegrityError
 
 from rucio.common.config import config_add_section, config_get, config_get_bool, config_has_section, config_remove_option, config_set
 from rucio.common.constants import OPENDATA_DID_STATE_LITERAL
-from rucio.common.exception import AccessDenied, DataIdentifierNotFound, OpenDataDataIdentifierAlreadyExists, OpenDataDataIdentifierNotFound, OpenDataDuplicateDOI, OpenDataDuplicateRecordID, OpenDataInvalidState, OpenDataInvalidStateUpdate
+from rucio.common.exception import (
+    AccessDenied,
+    DataIdentifierNotFound,
+    OpenDataDataIdentifierAlreadyExists,
+    OpenDataDataIdentifierNotFound,
+    OpenDataDuplicateDOI,
+    OpenDataDuplicateRecordID,
+    OpenDataInvalidState,
+    OpenDataInvalidStateUpdate,
+    UnsupportedOperation,
+)
 from rucio.common.utils import execute
 from rucio.core import opendata
-from rucio.core.did import add_did, set_status
+from rucio.core.did import add_did, attach_dids, detach_dids, set_status
+from rucio.core.replica import add_replica
 from rucio.core.rse import add_rse_attribute
 from rucio.db.sqla import models
 from rucio.db.sqla.constants import DIDType, OpenDataDIDState
@@ -99,6 +110,15 @@ class TestOpenDataCommon:
         rse_expression = config_get('opendata', 'rse_expression')
 
         assert rse_expression == OPENDATA_RSE_EXPRESSION, f"'opendata.rse_expression' should be '{OPENDATA_RSE_EXPRESSION}'"
+
+
+def _did_is_opendata(did, session):
+    return session.execute(
+        select(models.DataIdentifier.is_opendata).where(
+            models.DataIdentifier.scope == did["scope"],
+            models.DataIdentifier.name == did["name"],
+        )
+    ).scalar_one()
 
 
 @pytest.mark.noparallel(reason="Changes in configuration values and race conditions")
@@ -741,6 +761,154 @@ class TestOpenDataCore:
 
         finally:
             config_set('opendata', 'rse_expression', OPENDATA_RSE_EXPRESSION)
+
+    def test_opendata_tagging_registration_and_attach_detach(
+            self, did_factory, rse_factory, root_account, db_write_session):
+        _, rse_id = rse_factory.make_mock_rse(session=db_write_session)
+        dataset = did_factory.make_dataset(session=db_write_session)
+        existing_file = did_factory.random_file_did()
+        new_file = did_factory.random_file_did()
+
+        for file in (existing_file, new_file):
+            add_replica(
+                rse_id=rse_id, bytes_=10, account=root_account,
+                session=db_write_session, **file
+            )
+
+        attach_dids(
+            **dataset, dids=[existing_file], account=root_account,
+            session=db_write_session
+        )
+
+        # Registration must tag the dataset and existing files.
+        opendata.add_opendata_did(**dataset, session=db_write_session)
+        assert _did_is_opendata(dataset, db_write_session) is True
+        assert _did_is_opendata(existing_file, db_write_session) is True
+
+        # Files attached after registration must also be tagged.
+        attach_dids(
+            **dataset, dids=[new_file], account=root_account,
+            session=db_write_session
+        )
+        assert _did_is_opendata(new_file, db_write_session) is True
+
+        # Detaching a file with no other OpenData parent clears its flag.
+        detach_dids(
+            **dataset, dids=[new_file], session=db_write_session
+        )
+        assert _did_is_opendata(new_file, db_write_session) is False
+        assert _did_is_opendata(existing_file, db_write_session) is True
+
+    def test_opendata_tagging_shared_file(
+            self, did_factory, rse_factory, root_account, db_write_session):
+        _, rse_id = rse_factory.make_mock_rse(session=db_write_session)
+        dataset_a = did_factory.make_dataset(session=db_write_session)
+        dataset_b = did_factory.make_dataset(session=db_write_session)
+        normal_dataset = did_factory.make_dataset(session=db_write_session)
+        file = did_factory.random_file_did()
+
+        add_replica(
+            rse_id=rse_id, bytes_=10, account=root_account,
+            session=db_write_session, **file
+        )
+
+        for dataset in (dataset_a, dataset_b, normal_dataset):
+            attach_dids(
+                **dataset, dids=[file], account=root_account,
+                session=db_write_session
+            )
+
+        opendata.add_opendata_dids(
+            dids=[dataset_a, dataset_b], session=db_write_session
+        )
+        assert _did_is_opendata(file, db_write_session) is True
+
+        # Another OpenData parent still exists.
+        detach_dids(
+            **dataset_a, dids=[file], session=db_write_session
+        )
+        assert _did_is_opendata(file, db_write_session) is True
+
+        # A normal dataset does not keep the OpenData flag.
+        detach_dids(
+            **dataset_b, dids=[file], session=db_write_session
+        )
+        assert _did_is_opendata(file, db_write_session) is False
+
+        # Attaching again to an OpenData dataset restores the flag.
+        attach_dids(
+            **dataset_a, dids=[file], account=root_account,
+            session=db_write_session
+        )
+        assert _did_is_opendata(file, db_write_session) is True
+
+    def test_opendata_tagging_unregister_shared_dataset(
+            self, did_factory, rse_factory, root_account, db_write_session):
+        _, rse_id = rse_factory.make_mock_rse(session=db_write_session)
+        dataset_a = did_factory.make_dataset(session=db_write_session)
+        dataset_b = did_factory.make_dataset(session=db_write_session)
+        file = did_factory.random_file_did()
+
+        add_replica(
+            rse_id=rse_id, bytes_=10, account=root_account,
+            session=db_write_session, **file
+        )
+
+        for dataset in (dataset_a, dataset_b):
+            attach_dids(
+                **dataset, dids=[file], account=root_account,
+                session=db_write_session
+            )
+
+        opendata.add_opendata_dids(
+            dids=[dataset_a, dataset_b], session=db_write_session
+        )
+        assert _did_is_opendata(file, db_write_session) is True
+
+        opendata.delete_opendata_did(
+            **dataset_a, session=db_write_session
+        )
+        assert _did_is_opendata(dataset_a, db_write_session) is False
+        assert _did_is_opendata(dataset_b, db_write_session) is True
+        assert _did_is_opendata(file, db_write_session) is True
+
+        opendata.delete_opendata_did(
+            **dataset_b, session=db_write_session
+        )
+        assert _did_is_opendata(dataset_b, db_write_session) is False
+        assert _did_is_opendata(file, db_write_session) is False
+
+    def test_opendata_tagging_reject_non_datasets(
+            self, did_factory, rse_factory, root_account, db_write_session):
+        _, rse_id = rse_factory.make_mock_rse(session=db_write_session)
+        dataset = did_factory.make_dataset(session=db_write_session)
+        container = did_factory.make_container(session=db_write_session)
+        file = did_factory.random_file_did()
+
+        add_replica(
+            rse_id=rse_id, bytes_=10, account=root_account,
+            session=db_write_session, **file
+        )
+
+        for invalid_did in (file, container):
+            with pytest.raises(UnsupportedOperation):
+                opendata.add_opendata_did(
+                    **invalid_did, session=db_write_session
+                )
+
+        # A bulk request must not partially register valid datasets.
+        with pytest.raises(UnsupportedOperation):
+            opendata.add_opendata_dids(
+                dids=[dataset, file], session=db_write_session
+            )
+
+        assert _did_is_opendata(dataset, db_write_session) is not True
+        assert db_write_session.execute(
+            select(models.OpenDataDid.scope).where(
+                models.OpenDataDid.scope == dataset["scope"],
+                models.OpenDataDid.name == dataset["name"],
+            )
+        ).scalar_one_or_none() is None
 
 
 class _FakeCacheRegion:

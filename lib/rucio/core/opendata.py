@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 import requests
 from dogpile.cache.api import NoValue
-from sqlalchemy import and_, delete, func, insert, update
+from sqlalchemy import and_, case, delete, exists, func, insert, update
 from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.sql.expression import bindparam, select
 
@@ -713,6 +713,24 @@ def add_opendata_dids(
         if "scope" not in did or "name" not in did:
             raise exception.InputValidationError("DID must have 'scope' and 'name' keys.")
 
+        did_type = session.execute(
+            select(models.DataIdentifier.did_type).where(
+                models.DataIdentifier.scope == did["scope"],
+                models.DataIdentifier.name == did["name"],
+            )
+        ).scalar_one_or_none()
+
+        if did_type is None:
+            raise exception.DataIdentifierNotFound(
+                f"Data identifier '{did['scope']}:{did['name']}' not found."
+            )
+
+        if did_type != DIDType.DATASET:
+            raise exception.UnsupportedOperation(
+                f"Only datasets can be registered as OpenData: "
+                f"'{did['scope']}:{did['name']}' is a {did_type.name.lower()}."
+            )
+
     try:
         # The default state is DRAFT, set in the model
         session.execute(
@@ -738,6 +756,26 @@ def add_opendata_dids(
             raise exception.OpenDataDataIdentifierAlreadyExists()
 
         raise exception.DataIdentifierNotFound()
+
+    for did in dids:
+        session.execute(
+            update(models.DataIdentifier).where(
+                models.DataIdentifier.scope == did["scope"],
+                models.DataIdentifier.name == did["name"],
+            ).values(is_opendata=True)
+        )
+
+        session.execute(
+            update(models.DataIdentifier).where(
+                models.DataIdentifier.did_type == DIDType.FILE,
+                exists(select(1).where(
+                    models.DataIdentifierAssociation.scope == did["scope"],
+                    models.DataIdentifierAssociation.name == did["name"],
+                    models.DataIdentifierAssociation.child_scope == models.DataIdentifier.scope,
+                    models.DataIdentifierAssociation.child_name == models.DataIdentifier.name,
+                )),
+            ).values(is_opendata=True).execution_options(synchronize_session=False)
+        )
 
 
 def delete_opendata_did(
@@ -803,6 +841,61 @@ def delete_opendata_did(
 
     if result.rowcount == 0:
         raise ValueError(f"Error deleting Opendata entry '{scope}:{name}'.")
+
+    # Clear the flag on the dataset.
+    stmt = update(
+        models.DataIdentifier
+    ).where(
+        models.DataIdentifier.scope == scope,
+        models.DataIdentifier.name == name,
+        models.DataIdentifier.did_type == DIDType.DATASET,
+    ).values(
+        is_opendata=False
+    )
+    session.execute(stmt)
+
+    # Select files belonging to the dataset being unregistered.
+    affected_file = exists(
+        select(1)
+        .select_from(models.DataIdentifierAssociation)
+        .where(
+            models.DataIdentifierAssociation.scope == scope,
+            models.DataIdentifierAssociation.name == name,
+            models.DataIdentifierAssociation.child_scope == models.DataIdentifier.scope,
+            models.DataIdentifierAssociation.child_name == models.DataIdentifier.name,
+        )
+        .correlate(models.DataIdentifier)
+    )
+
+    # Check whether each file still belongs to another OpenData dataset.
+    remaining_opendata_parent = exists(
+        select(1)
+        .select_from(models.DataIdentifierAssociation)
+        .join(
+            models.OpenDataDid,
+            and_(
+                models.OpenDataDid.scope == models.DataIdentifierAssociation.scope,
+                models.OpenDataDid.name == models.DataIdentifierAssociation.name,
+            ),
+        )
+        .where(
+            models.DataIdentifierAssociation.child_scope == models.DataIdentifier.scope,
+            models.DataIdentifierAssociation.child_name == models.DataIdentifier.name,
+        )
+        .correlate(models.DataIdentifier)
+    )
+
+    stmt = update(
+        models.DataIdentifier
+    ).where(
+        models.DataIdentifier.did_type == DIDType.FILE,
+        affected_file,
+    ).values(
+        is_opendata=case((remaining_opendata_parent, True), else_=False)
+    ).execution_options(
+        synchronize_session=False
+    )
+    session.execute(stmt)
 
 
 def update_opendata_did(
